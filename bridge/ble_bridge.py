@@ -49,7 +49,13 @@ async def main() -> None:
     while True:
         try:
             async with BleakClient(addr) as client:
-                limit = min(MAX_BYTES, max(1, client.mtu_size - 3))
+                mtu = 23
+                try:
+                    await client._acquire_mtu()
+                    mtu = client.mtu_size
+                except Exception:
+                    pass
+                limit = min(MAX_BYTES, max(1, mtu - 3))
                 print("ok", flush=True)
                 while True:
                     raw = await reader.readline()
