@@ -56,12 +56,27 @@ async def discover_address(override: str):
     return None
 
 
+IDLE_CHECK_MS = 5.0
+
+
 async def main() -> None:
     override = os.environ.get("RGBIFY_PROJECTOR_ADDR", "").strip()
     loop = asyncio.get_running_loop()
     reader = asyncio.StreamReader()
     protocol = asyncio.StreamReaderProtocol(reader)
     await loop.connect_read_pipe(lambda: protocol, sys.stdin)
+
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def read_stdin() -> None:
+        while True:
+            raw = await reader.readline()
+            if not raw:
+                await queue.put(None)
+                return
+            await queue.put(raw.decode("utf-8", "replace").rstrip("\n"))
+
+    asyncio.create_task(read_stdin())
 
     while True:
         addr = await discover_address(override)
@@ -80,10 +95,14 @@ async def main() -> None:
                 limit = min(MAX_BYTES, max(1, mtu - 3))
                 print(f"ok {addr}", flush=True)
                 while True:
-                    raw = await reader.readline()
-                    if not raw:
+                    try:
+                        text = await asyncio.wait_for(queue.get(), timeout=IDLE_CHECK_MS)
+                    except asyncio.TimeoutError:
+                        if not client.is_connected:
+                            raise ConnectionError("projector disconnected while idle")
+                        continue
+                    if text is None:
                         return
-                    text = raw.decode("utf-8", "replace").rstrip("\n")
                     if not text:
                         print("ok", flush=True)
                         continue

@@ -110,6 +110,12 @@ export const RGBifyProjectorPlugin: Plugin = async ({ client }) => {
     return next
   }
 
+  startBridge().catch(async (err) => {
+    await client.app.log({
+      body: { service: "rgbify", level: "warn", message: `bridge unavailable: ${err}` },
+    })
+  })
+
   return {
     event: async ({ event }) => {
       if (event.type !== "message.part.updated") return
