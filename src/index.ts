@@ -25,18 +25,20 @@ function resolvePython(): string | null {
 const FLUSH_MS = 250
 const RATE = Math.max(1, parseFloat(process.env.RGBIFY_CHARS_PER_SEC ?? "30") || 30)
 
-const PREFIX_USER = process.env.RGBIFY_PREFIX_USER ?? ""
-const PREFIX_ASSISTANT = process.env.RGBIFY_PREFIX_ASSISTANT ?? ""
-const PREFIX_REASONING = process.env.RGBIFY_PREFIX_REASONING ?? ""
+const PREFIX_USER = process.env.RGBIFY_PREFIX_USER ?? "[U]"
+const PREFIX_ASSISTANT = process.env.RGBIFY_PREFIX_ASSISTANT ?? "[A]"
+const PREFIX_REASONING = process.env.RGBIFY_PREFIX_REASONING ?? "[R]"
+const PREFIX_TOOL = process.env.RGBIFY_PREFIX_TOOL ?? "[T]"
 
 function isEnabled(): boolean {
   return process.env.RGBIFY_DISABLE !== "1" && process.env.RGBIFY_DISABLE !== "true"
 }
 
-function prefixFor(kind: "user" | "assistant" | "reasoning"): string {
+function prefixFor(kind: "user" | "assistant" | "reasoning" | "tool"): string {
   if (kind === "user") return PREFIX_USER
   if (kind === "assistant") return PREFIX_ASSISTANT
-  return PREFIX_REASONING
+  if (kind === "reasoning") return PREFIX_REASONING
+  return PREFIX_TOOL
 }
 
 export const RGBifyProjectorPlugin: Plugin = async ({ client }) => {
@@ -151,6 +153,12 @@ export const RGBifyProjectorPlugin: Plugin = async ({ client }) => {
         if (part.type !== "text") continue
         sendNow(prefixFor("user") + part.text)
       }
+    },
+    "tool.execute.before": async (input) => {
+      send(prefixFor("tool") + input.tool)
+    },
+    "tool.execute.after": async () => {
+      send(prefixFor("tool") + "ok")
     },
   }
 }
