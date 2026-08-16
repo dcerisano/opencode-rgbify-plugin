@@ -1,10 +1,17 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import { spawn, which } from "bun"
+import { existsSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 import path from "node:path"
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const BRIDGE = path.join(here, "..", "bridge", "ble_bridge.py")
+const VENV_PYTHON = path.join(here, "..", ".venv", "bin", "python")
+
+function resolvePython(): string | null {
+  if (existsSync(VENV_PYTHON)) return VENV_PYTHON
+  return which("python3") ?? which("python")
+}
 
 const FLUSH_MS = 250
 const MAX_PENDING = 4000
@@ -36,7 +43,7 @@ export const RGBifyProjectorPlugin: Plugin = async ({ client }) => {
   function startBridge(): Promise<ReturnType<typeof spawn>> {
     if (procPromise) return procPromise
     procPromise = (async () => {
-      const python = which("python3") ?? which("python")
+      const python = resolvePython()
       if (!python) throw new Error("no python3/python interpreter found")
       const proc = spawn([python, BRIDGE], {
         stdin: "pipe",
