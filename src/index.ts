@@ -25,10 +25,10 @@ function resolvePython(): string | null {
 const FLUSH_MS = 250
 const RATE = Math.max(1, parseFloat(process.env.RGBIFY_CHARS_PER_SEC ?? "30") || 30)
 
-const PREFIX_USER = process.env.RGBIFY_PREFIX_USER ?? "[U]"
-const PREFIX_ASSISTANT = process.env.RGBIFY_PREFIX_ASSISTANT ?? "[A]"
-const PREFIX_REASONING = process.env.RGBIFY_PREFIX_REASONING ?? "[R]"
-const PREFIX_TOOL = process.env.RGBIFY_PREFIX_TOOL ?? "[T]"
+const PREFIX_USER = process.env.RGBIFY_PREFIX_USER ?? ""
+const PREFIX_ASSISTANT = process.env.RGBIFY_PREFIX_ASSISTANT ?? ""
+const PREFIX_REASONING = process.env.RGBIFY_PREFIX_REASONING ?? ""
+const PREFIX_TOOL = process.env.RGBIFY_PREFIX_TOOL ?? ""
 
 function isEnabled(): boolean {
   return process.env.RGBIFY_DISABLE !== "1" && process.env.RGBIFY_DISABLE !== "true"
