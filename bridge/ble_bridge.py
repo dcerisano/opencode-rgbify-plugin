@@ -21,7 +21,7 @@ from bleak import BleakClient, BleakScanner
 
 SERVICE_UUID = "8bc01404-0000-4bf4-95d1-ce27a0477183"
 TEXT_UUID = "8bc01404-0007-4bf4-95d1-ce27a0477183"
-BRIGHTNESS_UUID = "8bc01404-0003-4bf4-95d1-ce27a0477183"
+VOLUME_UUID = "8bc01404-0004-4bf4-95d1-ce27a0477183"
 DEVICE_NAME = "RGBify Projector"
 MAX_BYTES = 200
 RECONNECT_DELAY = 2.0
@@ -113,12 +113,12 @@ async def main() -> None:
                 # Warm up the ATT write path after every connect. The first
                 # write following a fresh link can be silently dropped by the
                 # ESP32 (it races the connection-parameter update). Read the
-                # current BRIGHTNESS and write it back unchanged: a no-op
-                # ping that primes the path and chirps, without touching TEXT
-                # or changing any state.
+                # current VOLUME and write it back unchanged: a no-op ping that
+                # primes the path and chirps the piezo (volume setter), without
+                # touching TEXT or changing any state.
                 try:
-                    value = await client.read_gatt_char(BRIGHTNESS_UUID)
-                    await client.write_gatt_char(BRIGHTNESS_UUID, value, response=True)
+                    value = await client.read_gatt_char(VOLUME_UUID)
+                    await client.write_gatt_char(VOLUME_UUID, value, response=True)
                 except Exception:
                     pass
                 while True:
