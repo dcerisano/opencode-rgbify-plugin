@@ -148,10 +148,10 @@ export const RGBifyProjectorPlugin: Plugin = async ({ client }) => {
       }
     },
     "tool.execute.before": async (input) => {
-      send("TOOL IN")
+      send("tool IN")
     },
     "tool.execute.after": async () => {
-      send("TOOL OUT")
+      send("tool out")
     },
   }
 }
