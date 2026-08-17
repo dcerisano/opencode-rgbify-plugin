@@ -25,20 +25,8 @@ function resolvePython(): string | null {
 const FLUSH_MS = 250
 const RATE = Math.max(1, parseFloat(process.env.RGBIFY_CHARS_PER_SEC ?? "30") || 30)
 
-const PREFIX_USER = process.env.RGBIFY_PREFIX_USER ?? ""
-const PREFIX_ASSISTANT = process.env.RGBIFY_PREFIX_ASSISTANT ?? ""
-const PREFIX_REASONING = process.env.RGBIFY_PREFIX_REASONING ?? ""
-const PREFIX_TOOL = process.env.RGBIFY_PREFIX_TOOL ?? ""
-
 function isEnabled(): boolean {
   return process.env.RGBIFY_DISABLE !== "1" && process.env.RGBIFY_DISABLE !== "true"
-}
-
-function prefixFor(kind: "user" | "assistant" | "reasoning" | "tool"): string {
-  if (kind === "user") return PREFIX_USER
-  if (kind === "assistant") return PREFIX_ASSISTANT
-  if (kind === "reasoning") return PREFIX_REASONING
-  return PREFIX_TOOL
 }
 
 export const RGBifyProjectorPlugin: Plugin = async ({ client }) => {
@@ -135,15 +123,20 @@ export const RGBifyProjectorPlugin: Plugin = async ({ client }) => {
       // keeps up and stays in sync with the session.
       if (t === "message.part.delta") {
         const p = event.properties as { field?: string; delta?: string }
-        if (typeof p.delta === "string" && p.delta) {
-          send(prefixFor(p.field === "reasoning" ? "reasoning" : "assistant") + p.delta)
+        // Only stream text/reasoning deltas. Tool-part deltas carry opencode
+        // internal tool-call JSON (messageID/callID/...) that would render as
+        // garbage on the projector; tool lifecycle is signalled separately.
+        if (p.field === "text" || p.field === "reasoning") {
+          if (typeof p.delta === "string" && p.delta) {
+            send(p.delta)
+          }
         }
         return
       }
       if (t === "session.next.text.delta" || t === "session.next.reasoning.delta") {
         const p = event.properties as { delta?: string }
         if (typeof p.delta === "string" && p.delta) {
-          send(prefixFor(t === "session.next.reasoning.delta" ? "reasoning" : "assistant") + p.delta)
+          send(p.delta)
         }
         return
       }
@@ -151,14 +144,14 @@ export const RGBifyProjectorPlugin: Plugin = async ({ client }) => {
     "chat.message": async (_input, output) => {
       for (const part of output.parts) {
         if (part.type !== "text") continue
-        sendNow(prefixFor("user") + part.text)
+        sendNow(part.text)
       }
     },
     "tool.execute.before": async (input) => {
-      send(prefixFor("tool") + input.tool)
+      send("TOOL IN")
     },
     "tool.execute.after": async () => {
-      send(prefixFor("tool") + "ok")
+      send("TOOL OUT")
     },
   }
 }

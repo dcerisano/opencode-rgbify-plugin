@@ -21,10 +21,15 @@ from bleak import BleakClient, BleakScanner
 
 SERVICE_UUID = "8bc01404-0000-4bf4-95d1-ce27a0477183"
 TEXT_UUID = "8bc01404-0007-4bf4-95d1-ce27a0477183"
+BRIGHTNESS_UUID = "8bc01404-0003-4bf4-95d1-ce27a0477183"
 DEVICE_NAME = "RGBify Projector"
 MAX_BYTES = 200
 RECONNECT_DELAY = 2.0
 SCAN_TIMEOUT = 5.0
+# The firmware shows a " Connect " banner and plays a connect sound on every
+# BLE connect. If the first line is written immediately after connect it gets
+# masked by that banner/sound. Hold queued lines this long after connect.
+CONNECT_SETTLE_MS = 2.0
 
 
 def chunk_text(text: str, limit: int):
@@ -57,6 +62,8 @@ async def discover_address(override: str):
 
 
 IDLE_CHECK_MS = 5.0
+WRITE_RETRIES = 10
+WRITE_RETRY_DELAY = 1.0
 
 
 async def main() -> None:
@@ -79,7 +86,12 @@ async def main() -> None:
     asyncio.create_task(read_stdin())
 
     while True:
-        addr = await discover_address(override)
+        try:
+            addr = await discover_address(override)
+        except Exception as e:
+            print(f"err scan failed: {e}", flush=True)
+            await asyncio.sleep(RECONNECT_DELAY)
+            continue
         if addr is None:
             print("err projector not found", flush=True)
             await asyncio.sleep(RECONNECT_DELAY)
@@ -94,6 +106,21 @@ async def main() -> None:
                     pass
                 limit = min(MAX_BYTES, max(1, mtu - 3))
                 print(f"ok {addr}", flush=True)
+                # Let the firmware finish its " Connect " banner/sound before
+                # delivering queued lines so the first prompt isn't masked.
+                if CONNECT_SETTLE_MS > 0 and not queue.empty():
+                    await asyncio.sleep(CONNECT_SETTLE_MS)
+                # Warm up the ATT write path after every connect. The first
+                # write following a fresh link can be silently dropped by the
+                # ESP32 (it races the connection-parameter update). Read the
+                # current BRIGHTNESS and write it back unchanged: a no-op
+                # ping that primes the path and chirps, without touching TEXT
+                # or changing any state.
+                try:
+                    value = await client.read_gatt_char(BRIGHTNESS_UUID)
+                    await client.write_gatt_char(BRIGHTNESS_UUID, value, response=True)
+                except Exception:
+                    pass
                 while True:
                     try:
                         text = await asyncio.wait_for(queue.get(), timeout=IDLE_CHECK_MS)
@@ -106,10 +133,30 @@ async def main() -> None:
                     if not text:
                         print("ok", flush=True)
                         continue
-                    for chunk in chunk_text(text, limit):
-                        await client.write_gatt_char(
-                            TEXT_UUID, chunk.encode("utf-8"), response=True
-                        )
+                    # The first write right after a fresh connect is commonly
+                    # flaky. Retry on the SAME connection with backoff instead of
+                    # tearing down and rescanning (which is slow and can drop the
+                    # line). Only give up if the connection itself is lost, then
+                    # requeue the line and reconnect so it isn't lost.
+                    delivered = False
+                    while not delivered:
+                        for attempt in range(1, WRITE_RETRIES + 1):
+                            try:
+                                for chunk in chunk_text(text, limit):
+                                    await client.write_gatt_char(
+                                        TEXT_UUID, chunk.encode("utf-8"), response=True
+                                    )
+                                delivered = True
+                                break
+                            except Exception:
+                                if not client.is_connected:
+                                    break
+                                if attempt < WRITE_RETRIES:
+                                    await asyncio.sleep(WRITE_RETRY_DELAY)
+                        if delivered:
+                            break
+                        await queue.put(text)
+                        raise ConnectionError("connection lost during write")
                     print("ok", flush=True)
         except Exception as e:
             print(f"err {e}", flush=True)
