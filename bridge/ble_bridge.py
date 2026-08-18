@@ -17,7 +17,11 @@ two stay in sync.
 
 Set RGBIFY_PROJECTOR_ADDR to skip discovery and use a fixed address.
 Set RGBIFY_HOST_AURALIZER=0 to disable the host auralizer (projector unaffected).
-Set RGBIFY_VOLUME to 0..10 (default 10).
+
+Host volume is mirrored from the projector's VOLUME characteristic whenever the
+projector is connected and persisted to the state file below so it survives
+restarts. While the projector is down you can still adjust the host volume by
+editing that file (or set RGBIFY_VOLUME as an initial default).
 
 stdout protocol (one line per event, for debugging):
   ok <addr>          connected / a line delivered
@@ -57,6 +61,32 @@ SAMPLE_RATE = 44100
 NOTE_SEC = 1.0 / 30
 HOST_AURALIZER = os.environ.get("RGBIFY_HOST_AURALIZER", "1").strip() != "0"
 HOST_VOLUME = int(os.environ.get("RGBIFY_VOLUME", "10").strip() or "10")
+# Persisted host volume: mirrored from the projector's VOLUME characteristic
+# when connected; editable at any time even when the projector is off. Lives in
+# the global opencode config dir (the user may not be inside a project), with
+# RGBIFY_STATE_DIR as an explicit override.
+STATE_DIR = os.environ.get(
+    "RGBIFY_STATE_DIR",
+    os.path.join(os.path.expanduser("~"), ".config", "opencode", "state"),
+)
+VOLUME_FILE = os.path.join(STATE_DIR, "host-volume")
+
+
+def load_volume() -> int:
+    try:
+        with open(VOLUME_FILE) as f:
+            return max(0, min(10, int(f.read().strip())))
+    except (OSError, ValueError):
+        return HOST_VOLUME
+
+
+def save_volume(value: int) -> None:
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(VOLUME_FILE, "w") as f:
+            f.write(str(max(0, min(10, value))))
+    except OSError:
+        pass
 
 
 def synth_text(text: str, volume: int) -> "np.ndarray":
@@ -68,7 +98,7 @@ def synth_text(text: str, volume: int) -> "np.ndarray":
     """
     n_samples = int(SAMPLE_RATE * NOTE_SEC)
     frames = []
-    peak = (max(0, min(10, volume)) / 10.0) * 32767 * 0.15
+    peak = (max(0, min(10, volume)) / 10.0) * 32767 * 0.05
     for ch in text:
         freq = -1021 + ord(ch) * 37
         t = n_samples
@@ -107,9 +137,28 @@ class HostAuralizer:
             return
         with self._lock:
             try:
-                self._stream.write(synth_text(text, HOST_VOLUME))
+                self._stream.write(synth_text(text, load_volume()))
             except Exception as e:
                 print(f"err host auralizer play: {e}", flush=True)
+
+    # Mirror the firmware's volume-change chirp: a short ~1970 Hz beep at the
+    # current volume, so the host confirms volume changes like the projector.
+    CHIRP_HZ = 1970
+    CHIRP_SEC = 0.030
+
+    def chirp(self) -> None:
+        if self._stream is None:
+            return
+        volume = load_volume()
+        n = int(SAMPLE_RATE * self.CHIRP_SEC)
+        t = np.arange(n)
+        samples = np.sin(2.0 * np.pi * self.CHIRP_HZ * t / SAMPLE_RATE)
+        peak = (max(0, min(10, volume)) / 10.0) * 32767 * 0.05
+        with self._lock:
+            try:
+                self._stream.write((samples * peak).astype(np.int16))
+            except Exception as e:
+                print(f"err host auralizer chirp: {e}", flush=True)
 
     def stop(self) -> None:
         with self._lock:
@@ -166,6 +215,8 @@ async def main() -> None:
     host_q: asyncio.Queue = asyncio.Queue()
     ble_q: asyncio.Queue = asyncio.Queue()
 
+    auralizer = HostAuralizer()
+
     async def read_stdin() -> None:
         while True:
             raw = await reader.readline()
@@ -188,7 +239,6 @@ async def main() -> None:
                 pass
 
     async def host_auralize() -> None:
-        auralizer = HostAuralizer()
         auralizer.start()
         try:
             while True:
@@ -239,6 +289,22 @@ async def main() -> None:
                     try:
                         value = await client.read_gatt_char(VOLUME_UUID)
                         await client.write_gatt_char(VOLUME_UUID, value, response=True)
+                        # Mirror the projector volume into the host state file so
+                        # both auralizers share the same volume setting.
+                        if value:
+                            save_volume(value[0])
+                    except Exception:
+                        pass
+                    # Subscribe to VOLUME notifications so a volume change made
+                    # elsewhere (e.g. the RGBify website) is mirrored to the
+                    # host state file live, even while connected.
+                    def on_volume_changed(_handle, data: bytes) -> None:
+                        if data:
+                            save_volume(data[0])
+                            auralizer.chirp()
+
+                    try:
+                        await client.start_notify(VOLUME_UUID, on_volume_changed)
                     except Exception:
                         pass
                     while True:
