@@ -36,6 +36,7 @@ stdout protocol (one line per event, for debugging):
 import os
 import sys
 import time
+import signal
 import threading
 import asyncio
 import subprocess
@@ -253,6 +254,21 @@ async def main() -> None:
     protocol = asyncio.StreamReaderProtocol(reader)
     await loop.connect_read_pipe(lambda: protocol, sys.stdin)
 
+    # Graceful shutdown: bluetoothd owns the BLE link, so an abrupt exit leaves
+    # the projector connected. Instead, every exit path (stdin EOF, parent death,
+    # SIGTERM/SIGINT) sets this event; the tasks unwind so the BleakClient exits
+    # its `async with` and disconnects cleanly before the process ends.
+    stop_event = asyncio.Event()
+
+    def request_stop() -> None:
+        stop_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, request_stop)
+        except (NotImplementedError, RuntimeError):
+            pass
+
     lines: asyncio.Queue = asyncio.Queue()
     # Latest-line slots (maxsize 1, replace-on-full): each sink keeps only the
     # most recent line, so a newer line interrupts (replaces) the previous one.
@@ -270,9 +286,8 @@ async def main() -> None:
             raw = await reader.readline()
             if not raw:
                 # stdin closed = the opencode plugin that spawned us is gone.
-                # Exit immediately (and drop the BLE connection) so we never
-                # linger as an orphaned process holding the projector.
-                os._exit(0)
+                request_stop()
+                return
             await lines.put(raw.decode("utf-8", "replace").rstrip("\n"))
 
     def push_latest(q: asyncio.Queue, line: str) -> None:
@@ -287,7 +302,7 @@ async def main() -> None:
         # still busy with an older line, the older one is discarded — the last
         # message is the only message. While disconnected, lines are dropped so
         # nothing accumulates for replay on reconnect.
-        while True:
+        while not stop_event.is_set():
             line = await lines.get()
             if not connected:
                 continue
@@ -301,7 +316,7 @@ async def main() -> None:
         current = None
         pos = 0
         try:
-            while True:
+            while not stop_event.is_set():
                 try:
                     current = host_line.get_nowait()
                     pos = 0
@@ -321,12 +336,13 @@ async def main() -> None:
         # plugin that spawned us dies, but if another child of opencode (e.g. an
         # MCP server) inherited the pipe's write end, EOF never arrives. Detect
         # the parent's death directly instead: when it dies we are reparented
-        # (ppid changes), so exit then.
+        # (ppid changes), so request a graceful stop then.
         ppid = os.getppid()
-        while True:
+        while not stop_event.is_set():
             await asyncio.sleep(1)
             if os.getppid() != ppid:
-                os._exit(0)
+                request_stop()
+                return
 
     asyncio.create_task(read_stdin())
     asyncio.create_task(broadcast())
@@ -335,7 +351,7 @@ async def main() -> None:
 
     async def ble_loop() -> None:
         nonlocal connected
-        while True:
+        while not stop_event.is_set():
             try:
                 addr = await discover_address(override)
             except Exception as e:
@@ -422,7 +438,7 @@ async def main() -> None:
                         await client.start_notify(VOLUME_UUID, on_volume_changed)
                     except Exception:
                         pass
-                    while True:
+                    while not stop_event.is_set():
                         try:
                             text = await asyncio.wait_for(
                                 ble_line.get(), timeout=IDLE_CHECK_MS
@@ -460,6 +476,16 @@ async def main() -> None:
                 connected = False
                 print(f"err {e}", flush=True)
                 await asyncio.sleep(RECONNECT_DELAY)
+
+    # Hard fallback: once a stop is requested, the graceful path normally
+    # disconnects within a few seconds (the idle wait is up to IDLE_CHECK_MS),
+    # but never let the bridge linger as an orphan.
+    async def watchdog() -> None:
+        await stop_event.wait()
+        await asyncio.sleep(10)
+        os._exit(0)
+
+    asyncio.create_task(watchdog())
 
     await asyncio.gather(host_task, ble_loop())
 
