@@ -76,7 +76,10 @@ export const RGBifyProjectorPlugin: Plugin = async ({ client }) => {
       void proc.stderr?.pipeTo(
         new WritableStream({ write() {} }),
       )
-      void proc.exited.catch(() => {
+      // proc.exited RESOLVES (with the exit code) on exit — it does NOT reject,
+      // so a `.catch` would never fire and the bridge would never respawn. Use
+      // `.finally` so a dead bridge is replaced by the next send().
+      void proc.exited.finally(() => {
         procPromise = null
       })
       return proc
@@ -155,6 +158,18 @@ export const RGBifyProjectorPlugin: Plugin = async ({ client }) => {
     },
     "tool.execute.after": async () => {
       send("tool out")
+    },
+    // When opencode shuts down, kill the bridge so it doesn't linger as an
+    // orphan holding the projector connection. Closing its stdin would also do
+    // it (the bridge exits on EOF), but kill is immediate and explicit.
+    dispose: async () => {
+      if (procPromise) {
+        try {
+          const proc = await procPromise
+          proc.kill()
+        } catch {}
+        procPromise = null
+      }
     },
   }
 }

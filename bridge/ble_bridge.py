@@ -14,7 +14,8 @@ with backoff so the plugin stays a silent no-op while the projector is out of
 range or powered off.
 
 Every line is ALSO auralized on the host (sounddevice) at the firmware's native
-cadence (one ~33ms note per char, freq = -1021 + c*37 Hz, whitespace = rest), so
+cadence (one ~33ms note per char, log-scale freq table identical to the
+firmware, whitespace = rest), so
 sound never stops while the projector is away. The host auralizer runs always
 and independently of the BLE connection; when the projector is reachable both
 play the same line (best-effort sync). Lines missed while the projector is down
@@ -102,16 +103,37 @@ def save_volume(value: int) -> None:
         pass
 
 
+# Mirror the firmware's log-scale auralizer lookup table exactly (firmware
+# rgbify-projector-esp32.ino `auralizer_freq[91]`, committed 691c899):
+# index = ord(c) - 32 for ASCII 32..122, mapping ' '=space..'z' -> 5000..100 Hz.
+AURALIZER_FREQ = [
+    5000, 4887, 4778, 4672, 4569, 4468, 4371, 4276,
+    4183, 4093, 4004, 3918, 3834, 3752, 3671, 3593,
+    3515, 3440, 3366, 3293, 3222, 3153, 3084, 3017,
+    2951, 2886, 2823, 2760, 2698, 2638, 2578, 2520,
+    2462, 2405, 2349, 2294, 2240, 2187, 2134, 2082,
+    2031, 1980, 1931, 1881, 1833, 1785, 1738, 1691,
+    1645, 1600, 1555, 1510, 1466, 1423, 1380, 1338,
+    1296, 1255, 1214, 1173, 1133, 1094, 1055, 1016,
+    978, 940, 902, 865, 828, 792, 756, 720,
+    684, 649, 615, 580, 546, 513, 479, 446,
+    413, 381, 348, 316, 285, 253, 222, 191,
+    161, 130, 100,
+]
+
+
 def synth_note(ch: str, volume: int) -> "np.ndarray":
     """Return int16 mono PCM samples for ONE char (~33ms note).
 
-    Frequency mirrors the firmware auralizer (`-1021 + c*37` Hz); whitespace is
-    a rest. Played one note at a time so a newer line can interrupt mid-message.
+    Frequency mirrors the firmware auralizer exactly (log-scale lookup table,
+    same values as the firmware's `auralizer_freq[c - 32]`); whitespace is a
+    rest. Played one note at a time so a newer line can interrupt mid-message.
     """
     n_samples = int(SAMPLE_RATE * NOTE_SEC)
-    freq = -1021 + ord(ch) * 37
-    if ch in " \t\n\r" or freq <= 0:
+    c = ord(ch)
+    if ch in " \t\n\r" or not (32 <= c <= 122):
         return np.zeros(n_samples, dtype=np.int16)
+    freq = AURALIZER_FREQ[c - 32]
     peak = (max(0, min(10, volume)) / 10.0) * 32767 * 0.05
     t = np.arange(n_samples)
     samples = np.sin(2.0 * np.pi * freq * t / SAMPLE_RATE)
@@ -247,8 +269,10 @@ async def main() -> None:
         while True:
             raw = await reader.readline()
             if not raw:
-                await lines.put(None)
-                return
+                # stdin closed = the opencode plugin that spawned us is gone.
+                # Exit immediately (and drop the BLE connection) so we never
+                # linger as an orphaned process holding the projector.
+                os._exit(0)
             await lines.put(raw.decode("utf-8", "replace").rstrip("\n"))
 
     def push_latest(q: asyncio.Queue, line: str) -> None:
@@ -345,12 +369,17 @@ async def main() -> None:
                         except asyncio.QueueEmpty:
                             pass
                     connected = True
-                    mtu = 23
+                    # Acquire the negotiated ATT MTU. Bleak 3.x keeps the
+                    # public _acquire_mtu() off the wrapper — it lives on the
+                    # backend (_acquire_mtu on client._backend) — so the old
+                    # call raised AttributeError and was swallowed, leaving mtu
+                    # at 23 and capping every payload at 20 chars. The firmware
+                    # raises its local MTU to 517, so we get the full MAX_BYTES.
                     try:
-                        await client._acquire_mtu()
-                        mtu = client.mtu_size
+                        await client._backend._acquire_mtu()
                     except Exception:
                         pass
+                    mtu = client.mtu_size
                     limit = min(MAX_BYTES, max(1, mtu - 3))
                     print(f"ok {addr}", flush=True)
                     # The firmware plays a connect sound via wavAC() which blocks
