@@ -66,9 +66,10 @@ SCAN_TIMEOUT = 5.0
 # current connect sound is dialup_wav (88000 samples @ 16kHz = 5.5s), so 6s.
 CONNECT_SETTLE_MS = 6.0
 # The projector advertises as soon as it powers up, but needs a moment to
-# finish booting before it can accept a BLE connection. Wait this long after
-# discovering it before connecting.
-CONNECT_DELAY = 5.0
+# finish booting before it can accept a BLE connection. On a first connect
+# after power-up a failed attempt just retries (RECONNECT_DELAY), so keep this
+# small instead of adding a fixed multi-second delay on every reconnect.
+CONNECT_DELAY = 1.0
 
 # Host auralizer: mirrors the firmware Auralizer (one note per frame @ 30fps,
 # freq = -1021 + c*37 Hz for non-space chars, whitespace = rest, volume 0-10).

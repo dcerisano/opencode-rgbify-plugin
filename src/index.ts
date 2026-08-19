@@ -70,7 +70,13 @@ export const RGBifyProjectorPlugin: Plugin = async ({ client }) => {
         stdin: "pipe",
         stdout: "pipe",
         stderr: "pipe",
-        env: { ...process.env },
+        // Skip BLE discovery (a ~5s scan) on every connect: default to the
+        // projector's fixed address unless the user overrides it.
+        env: {
+          ...process.env,
+          RGBIFY_PROJECTOR_ADDR:
+            process.env.RGBIFY_PROJECTOR_ADDR || "40:91:51:AB:50:CE",
+        },
       })
       void proc.stdout?.pipeTo(new WritableStream({ write() {} }))
       void proc.stderr?.pipeTo(
