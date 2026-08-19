@@ -248,23 +248,65 @@ async def discover_address(override: str):
 IDLE_CHECK_MS = 5.0
 
 
+def arm_parent_death_signal(parent_pid: int) -> None:
+    """Linux: have the kernel SIGTERM us the instant our parent (opencode) dies,
+    no matter how (SIGKILL, destroyed terminal, crash). prctl is per-thread and
+    racy — the parent can die before we arm it — so set it on the main thread
+    and bail out immediately if the parent is already gone (the ppid changed).
+    On non-Linux or if prctl is unavailable, silently fall back to the ppid
+    watchdog in watch_parent()."""
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        import ctypes
+
+        ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
+    except Exception:
+        return
+    if os.getppid() != parent_pid:
+        os._exit(0)
+
+
+async def wait_line_or_stop(
+    q: "asyncio.Queue", stop_event: "asyncio.Event", timeout: float
+):
+    """Race the BLE line queue against the stop event. Returns
+    ("line", text) when a line arrives, ("stop", None) the instant a stop is
+    requested (no waiting for the timeout), or ("idle", None) after `timeout`
+    with no line and no stop. Without this, a SIGTERM during the idle wait was
+    only noticed after IDLE_CHECK_MS (5s) — the disconnect lagged."""
+    line_task = asyncio.ensure_future(q.get())
+    stop_task = asyncio.ensure_future(stop_event.wait())
+    done, pending = await asyncio.wait(
+        {line_task, stop_task}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+    )
+    for t in pending:
+        t.cancel()
+    if stop_task in done:
+        return ("stop", None)
+    if line_task in done:
+        return ("line", line_task.result())
+    return ("idle", None)
+
+
 async def main() -> None:
     override = os.environ.get("RGBIFY_PROJECTOR_ADDR", "").strip()
+    arm_parent_death_signal(os.getppid())
     loop = asyncio.get_running_loop()
     reader = asyncio.StreamReader()
     protocol = asyncio.StreamReaderProtocol(reader)
     await loop.connect_read_pipe(lambda: protocol, sys.stdin)
 
-    # Graceful shutdown: bluetoothd owns the BLE link, so an abrupt exit leaves
-    # the projector connected. Instead, every exit path (stdin EOF, parent death,
-    # SIGTERM/SIGINT) sets this event; the tasks unwind so the BleakClient exits
-    # its `async with` and disconnects cleanly before the process ends.
+    # Graceful shutdown on every death path: SIGTERM (plugin dispose,
+    # pdeathsig), SIGHUP (terminal destroyed), stdin EOF (parent's pipe gone),
+    # or the ppid watchdog. Each sets stop_event; the tasks unwind so the
+    # BleakClient exits its `async with` and disconnects cleanly first.
     stop_event = asyncio.Event()
 
     def request_stop() -> None:
         stop_event.set()
 
-    for sig in (signal.SIGTERM, signal.SIGINT):
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         try:
             loop.add_signal_handler(sig, request_stop)
         except (NotImplementedError, RuntimeError):
@@ -439,17 +481,16 @@ async def main() -> None:
                         await client.start_notify(VOLUME_UUID, on_volume_changed)
                     except Exception:
                         pass
-                    while not stop_event.is_set():
-                        try:
-                            text = await asyncio.wait_for(
-                                ble_line.get(), timeout=IDLE_CHECK_MS
-                            )
-                        except asyncio.TimeoutError:
+                    while True:
+                        kind, text = await wait_line_or_stop(
+                            ble_line, stop_event, IDLE_CHECK_MS
+                        )
+                        if kind == "stop":
+                            return
+                        if kind == "idle":
                             if not client.is_connected:
                                 raise ConnectionError("projector disconnected while idle")
                             continue
-                        if text is None:
-                            return
                         if not text:
                             print("ok", flush=True)
                             continue
@@ -459,10 +500,11 @@ async def main() -> None:
                             if elapsed < CONNECT_SETTLE_MS:
                                 await asyncio.sleep(CONNECT_SETTLE_MS - elapsed)
                         # Interrupt semantics: deliver the latest line in chunks,
-                        # but if a newer line arrives mid-delivery, drop the rest
-                        # of this one — the outer loop picks up the new line.
+                        # but if a newer line arrives mid-delivery (or a stop is
+                        # requested), drop the rest of this one — the outer loop
+                        # picks up the new line / disconnects immediately.
                         for chunk in chunk_text(text, limit):
-                            if not ble_line.empty():
+                            if not ble_line.empty() or stop_event.is_set():
                                 break
                             try:
                                 await client.write_gatt_char(
