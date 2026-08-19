@@ -341,16 +341,18 @@ async def main() -> None:
             q.put_nowait(line)
 
     async def broadcast() -> None:
-        # Fan every line out to both sinks as the LATEST line. If a sink is
-        # still busy with an older line, the older one is discarded — the last
-        # message is the only message. While disconnected, lines are dropped so
-        # nothing accumulates for replay on reconnect.
+        # Fan every line out as the LATEST line. While the projector is
+        # connected, feed only ble_line — the BLE loop hands every chunk it
+        # writes back to host_line, so the host auralizer plays EXACTLY the
+        # bytes the projector receives (char-perfect sync). While disconnected,
+        # raw lines go to host_line only, so the host keeps auralizing
+        # always-on and nothing accumulates for replay on reconnect.
         while not stop_event.is_set():
             line = await lines.get()
-            if not connected:
-                continue
-            push_latest(host_line, line)
-            push_latest(ble_line, line)
+            if connected:
+                push_latest(ble_line, line)
+            else:
+                push_latest(host_line, line)
 
     async def host_auralize() -> None:
         # One ~33ms note per char, in cadence with the firmware (30 fps). A new
@@ -514,6 +516,10 @@ async def main() -> None:
                                 # Transient/failed write: the next line supersedes
                                 # this one anyway, so just move on.
                                 break
+                            # Perfect sync: the host auralizer plays EXACTLY the
+                            # bytes the projector just received — same chars, same
+                            # interrupt points, same cadence.
+                            push_latest(host_line, chunk)
                         print("ok", flush=True)
             except Exception as e:
                 connected = False

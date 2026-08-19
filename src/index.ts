@@ -104,6 +104,12 @@ export const RGBifyProjectorPlugin: Plugin = async ({ client }) => {
     startBridge()
       .then((proc) => {
         proc.stdin.write(line + "\n")
+        // Bun's FileSink buffers writes; without flush() the bridge receives
+        // them in delayed bursts, desyncing the projector/host from opencode.
+        const r = proc.stdin.flush()
+        if (r && typeof (r as Promise<number>).then === "function") {
+          ;(r as Promise<number>).catch(() => {})
+        }
       })
       .catch(async (err) => {
         await client.app.log({

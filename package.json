@@ -1,6 +1,6 @@
 {
   "name": "opencode-rgbify-plugin",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "opencode plugin: stream chat text deltas to an RGBify 8x8 projector over BLE",
   "type": "module",
   "license": "MIT",
