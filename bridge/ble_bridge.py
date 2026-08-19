@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """BLE bridge: stream newline-delimited text from stdin to the RGBify projector.
 
+Interrupt semantics end to end: every line is a new message that supersedes
+anything still in flight. The host auralizer and the BLE write path each keep
+only the LATEST line — a newer line interrupts (replaces) the previous one at
+the next note/chunk boundary, so the last message is the only message. Nothing
+is queued, delayed, or replayed.
+
 Discovers the projector at connect time (by advertised service UUID, then name),
-chunks each line into codepoint-safe pieces that fit within the projector's TEXT
-payload limit, and writes them to the TEXT characteristic. Reconnects forever
+chunks each line into codepoint-safe pieces that fit within the projector's TEXT_BRIDGE
+payload limit, and writes them to the TEXT_BRIDGE characteristic. Reconnects forever
 with backoff so the plugin stays a silent no-op while the projector is out of
 range or powered off.
 
@@ -11,9 +17,8 @@ Every line is ALSO auralized on the host (sounddevice) at the firmware's native
 cadence (one ~33ms note per char, freq = -1021 + c*37 Hz, whitespace = rest), so
 sound never stops while the projector is away. The host auralizer runs always
 and independently of the BLE connection; when the projector is reachable both
-play the same line (line-level best-effort sync). Lines missed while the
-projector is down are dropped for the projector (no replay on reconnect) so the
-two stay in sync.
+play the same line (best-effort sync). Lines missed while the projector is down
+are dropped for the projector (no replay on reconnect) so the two stay in sync.
 
 Set RGBIFY_PROJECTOR_ADDR to skip discovery and use a fixed address.
 Set RGBIFY_HOST_AURALIZER=0 to disable the host auralizer (projector unaffected).
@@ -29,8 +34,10 @@ stdout protocol (one line per event, for debugging):
 """
 import os
 import sys
+import time
 import threading
 import asyncio
+import subprocess
 
 from bleak import BleakClient, BleakScanner
 
@@ -44,16 +51,22 @@ except ImportError:
     SOUNDDEVICE_OK = False
 
 SERVICE_UUID = "8bc01404-0000-4bf4-95d1-ce27a0477183"
-TEXT_UUID = "8bc01404-0007-4bf4-95d1-ce27a0477183"
+TEXT_BRIDGE_UUID = "8bc01404-0009-4bf4-95d1-ce27a0477183"
 VOLUME_UUID = "8bc01404-0004-4bf4-95d1-ce27a0477183"
 DEVICE_NAME = "RGBify Projector"
 MAX_BYTES = 200
 RECONNECT_DELAY = 2.0
 SCAN_TIMEOUT = 5.0
 # The firmware shows a " Connect " banner and plays a connect sound on every
-# BLE connect. If the first line is written immediately after connect it gets
-# masked by that banner/sound. Hold queued lines this long after connect.
-CONNECT_SETTLE_MS = 2.0
+# BLE connect. wavAC() blocks the main loop until playback completes, so any
+# line written while it plays gets its notes reset by the next chunk and is
+# never auralized. Hold queued lines until the connect sound is done: the
+# current connect sound is dialup_wav (88000 samples @ 16kHz = 5.5s), so 6s.
+CONNECT_SETTLE_MS = 6.0
+# The projector advertises as soon as it powers up, but needs a moment to
+# finish booting before it can accept a BLE connection. Wait this long after
+# discovering it before connecting.
+CONNECT_DELAY = 5.0
 
 # Host auralizer: mirrors the firmware Auralizer (one note per frame @ 30fps,
 # freq = -1021 + c*37 Hz for non-space chars, whitespace = rest, volume 0-10).
@@ -89,35 +102,33 @@ def save_volume(value: int) -> None:
         pass
 
 
-def synth_text(text: str, volume: int) -> "np.ndarray":
-    """Return int16 mono PCM samples for one line, one ~33ms note per char.
+def synth_note(ch: str, volume: int) -> "np.ndarray":
+    """Return int16 mono PCM samples for ONE char (~33ms note).
 
     Frequency mirrors the firmware auralizer (`-1021 + c*37` Hz); whitespace is
-    a rest. Notes are continuous (no gaps between chars) like the firmware's
-    pitch glide.
+    a rest. Played one note at a time so a newer line can interrupt mid-message.
     """
     n_samples = int(SAMPLE_RATE * NOTE_SEC)
-    frames = []
+    freq = -1021 + ord(ch) * 37
+    if ch in " \t\n\r" or freq <= 0:
+        return np.zeros(n_samples, dtype=np.int16)
     peak = (max(0, min(10, volume)) / 10.0) * 32767 * 0.05
-    for ch in text:
-        freq = -1021 + ord(ch) * 37
-        t = n_samples
-        if ch in " \t\n\r" or freq <= 0:
-            frames.append(np.zeros(t, dtype=np.int16))
-            continue
-        samples = np.sin(2.0 * np.pi * freq * np.arange(t) / SAMPLE_RATE)
-        frames.append((samples * peak).astype(np.int16))
-    if not frames:
-        return np.zeros(0, dtype=np.int16)
-    return np.concatenate(frames)
+    t = np.arange(n_samples)
+    samples = np.sin(2.0 * np.pi * freq * t / SAMPLE_RATE)
+    return (samples * peak).astype(np.int16)
 
 
 class HostAuralizer:
-    """Always-on host audio sink fed from the broadcast loop."""
+    """Always-on host audio sink. Plays one ~33ms note at a time; a newer note
+    interrupts (replaces) the previous one, so the last message is the only
+    message on the host too."""
 
     def __init__(self) -> None:
         self._stream = None
-        self._lock = threading.Lock()
+        self._pending = None  # int16 mono PCM of the current note
+        self._event = threading.Event()
+        self._thread = None
+        self._stop = False
 
     def start(self) -> None:
         if not (SOUNDDEVICE_OK and HOST_AURALIZER):
@@ -127,19 +138,32 @@ class HostAuralizer:
                 samplerate=SAMPLE_RATE, channels=1, dtype="int16"
             )
             self._stream.start()
-            print("ok host auralizer", flush=True)
         except Exception as e:
             self._stream = None
             print(f"err host auralizer unavailable: {e}", flush=True)
-
-    def play(self, text: str) -> None:
-        if self._stream is None:
             return
-        with self._lock:
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        print("ok host auralizer", flush=True)
+
+    def _run(self) -> None:
+        stream = self._stream
+        while not self._stop:
+            self._event.wait()
+            self._event.clear()
+            note = self._pending
+            if note is None or stream is None:
+                continue
             try:
-                self._stream.write(synth_text(text, load_volume()))
+                stream.write(note)
             except Exception as e:
                 print(f"err host auralizer play: {e}", flush=True)
+
+    def play_note(self, note: "np.ndarray") -> None:
+        # Latest wins: a note pushed while the previous one is playing replaces
+        # it — the pump picks it up as soon as the current write finishes.
+        self._pending = note
+        self._event.set()
 
     # Mirror the firmware's volume-change chirp: a short ~1970 Hz beep at the
     # current volume, so the host confirms volume changes like the projector.
@@ -149,25 +173,23 @@ class HostAuralizer:
     def chirp(self) -> None:
         if self._stream is None:
             return
-        volume = load_volume()
         n = int(SAMPLE_RATE * self.CHIRP_SEC)
         t = np.arange(n)
         samples = np.sin(2.0 * np.pi * self.CHIRP_HZ * t / SAMPLE_RATE)
-        peak = (max(0, min(10, volume)) / 10.0) * 32767 * 0.05
-        with self._lock:
-            try:
-                self._stream.write((samples * peak).astype(np.int16))
-            except Exception as e:
-                print(f"err host auralizer chirp: {e}", flush=True)
+        peak = (max(0, min(10, load_volume())) / 10.0) * 32767 * 0.05
+        self.play_note((samples * peak).astype(np.int16))
 
     def stop(self) -> None:
-        with self._lock:
-            if self._stream is not None:
-                try:
-                    self._stream.stop()
-                except Exception:
-                    pass
-                self._stream = None
+        self._stop = True
+        self._event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.5)
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+            except Exception:
+                pass
+            self._stream = None
 
 
 def chunk_text(text: str, limit: int):
@@ -200,8 +222,6 @@ async def discover_address(override: str):
 
 
 IDLE_CHECK_MS = 5.0
-WRITE_RETRIES = 10
-WRITE_RETRY_DELAY = 1.0
 
 
 async def main() -> None:
@@ -212,8 +232,14 @@ async def main() -> None:
     await loop.connect_read_pipe(lambda: protocol, sys.stdin)
 
     lines: asyncio.Queue = asyncio.Queue()
-    host_q: asyncio.Queue = asyncio.Queue()
-    ble_q: asyncio.Queue = asyncio.Queue()
+    # Latest-line slots (maxsize 1, replace-on-full): each sink keeps only the
+    # most recent line, so a newer line interrupts (replaces) the previous one.
+    host_line: asyncio.Queue = asyncio.Queue(maxsize=1)
+    ble_line: asyncio.Queue = asyncio.Queue(maxsize=1)
+
+    # While disconnected, no lines reach either sink — nothing is queued or
+    # replayed. Delivery starts fresh with the first line after a connect.
+    connected = False
 
     auralizer = HostAuralizer()
 
@@ -225,28 +251,44 @@ async def main() -> None:
                 return
             await lines.put(raw.decode("utf-8", "replace").rstrip("\n"))
 
+    def push_latest(q: asyncio.Queue, line: str) -> None:
+        try:
+            q.put_nowait(line)
+        except asyncio.QueueFull:
+            q.get_nowait()
+            q.put_nowait(line)
+
     async def broadcast() -> None:
-        # Fan every line out to both sinks simultaneously. The host queue is
-        # awaited (never drops); the BLE queue drops-on-full so a slow/down
-        # projector can never stall the always-on host auralizer. Lines lost
-        # here were already auralized on the host and are skipped on reconnect.
+        # Fan every line out to both sinks as the LATEST line. If a sink is
+        # still busy with an older line, the older one is discarded — the last
+        # message is the only message. While disconnected, lines are dropped so
+        # nothing accumulates for replay on reconnect.
         while True:
             line = await lines.get()
-            await host_q.put(line)
-            try:
-                ble_q.put_nowait(line)
-            except asyncio.QueueFull:
-                pass
+            if not connected:
+                continue
+            push_latest(host_line, line)
+            push_latest(ble_line, line)
 
     async def host_auralize() -> None:
+        # One ~33ms note per char, in cadence with the firmware (30 fps). A new
+        # line replaces the current one at the next note boundary (interrupt).
         auralizer.start()
+        current = None
+        pos = 0
         try:
             while True:
-                line = await host_q.get()
-                if line is None:
-                    return
-                if line:
-                    await asyncio.to_thread(auralizer.play, line)
+                try:
+                    current = host_line.get_nowait()
+                    pos = 0
+                except asyncio.QueueEmpty:
+                    pass
+                if current is not None and pos < len(current):
+                    auralizer.play_note(synth_note(current[pos], load_volume()))
+                    pos += 1
+                else:
+                    current = None
+                await asyncio.sleep(NOTE_SEC)
         finally:
             auralizer.stop()
 
@@ -255,6 +297,7 @@ async def main() -> None:
     host_task = asyncio.create_task(host_auralize())
 
     async def ble_loop() -> None:
+        nonlocal connected
         while True:
             try:
                 addr = await discover_address(override)
@@ -266,8 +309,42 @@ async def main() -> None:
                 print("err projector not found", flush=True)
                 await asyncio.sleep(RECONNECT_DELAY)
                 continue
+            # The projector advertises immediately on power-up but isn't ready to
+            # accept a connection until it finishes booting. Give it a moment.
+            await asyncio.sleep(CONNECT_DELAY)
             try:
-                async with BleakClient(addr) as client:
+                # When the projector resets/reboots, drop any queued text so
+                # stale lines buffered before the disconnect are not delivered
+                # on reconnect.
+                def on_disconnect(_client) -> None:
+                    nonlocal connected
+                    connected = False
+                    for q in (host_line, ble_line):
+                        try:
+                            q.get_nowait()
+                        except asyncio.QueueEmpty:
+                            pass
+                    print("disconnect", flush=True)
+                    # Belt-and-suspenders: force-clear BlueZ's connection state
+                    # so no stale writes survive into the next connection.
+                    try:
+                        subprocess.Popen(
+                            ["bluetoothctl", "disconnect", addr],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                    except Exception:
+                        pass
+
+                async with BleakClient(addr, disconnected_callback=on_disconnect) as client:
+                    # Clear anything that slipped in before the flag flipped, so
+                    # delivery starts fresh with the first line after connect.
+                    for q in (host_line, ble_line):
+                        try:
+                            q.get_nowait()
+                        except asyncio.QueueEmpty:
+                            pass
+                    connected = True
                     mtu = 23
                     try:
                         await client._acquire_mtu()
@@ -276,28 +353,24 @@ async def main() -> None:
                         pass
                     limit = min(MAX_BYTES, max(1, mtu - 3))
                     print(f"ok {addr}", flush=True)
-                    # Let the firmware finish its " Connect " banner/sound before
-                    # delivering queued lines so the first prompt isn't masked.
-                    if CONNECT_SETTLE_MS > 0 and not ble_q.empty():
-                        await asyncio.sleep(CONNECT_SETTLE_MS)
-                    # Warm up the ATT write path after every connect. The first
-                    # write following a fresh link can be silently dropped by the
-                    # ESP32 (it races the connection-parameter update). Read the
-                    # current VOLUME and write it back unchanged: a no-op ping that
-                    # primes the path and chirps the piezo (volume setter), without
-                    # touching TEXT or changing any state.
+                    # The firmware plays a connect sound via wavAC() which blocks
+                    # the main loop until playback completes. Any line written
+                    # while it plays gets its notes reset by the next chunk and is
+                    # never auralized. Hold the FIRST line after each connect until
+                    # the connect sound is done (dialup_wav = 5.5s), no matter when
+                    # it arrives.
+                    connected_at = time.monotonic()
+                    first_write = True
+                    # Read the current projector volume on connect so the host
+                    # state file starts in sync, then subscribe to VOLUME
+                    # notifications so later changes (e.g. from the RGBify
+                    # website) are mirrored live.
                     try:
                         value = await client.read_gatt_char(VOLUME_UUID)
-                        await client.write_gatt_char(VOLUME_UUID, value, response=True)
-                        # Mirror the projector volume into the host state file so
-                        # both auralizers share the same volume setting.
                         if value:
                             save_volume(value[0])
                     except Exception:
                         pass
-                    # Subscribe to VOLUME notifications so a volume change made
-                    # elsewhere (e.g. the RGBify website) is mirrored to the
-                    # host state file live, even while connected.
                     def on_volume_changed(_handle, data: bytes) -> None:
                         if data:
                             save_volume(data[0])
@@ -310,7 +383,7 @@ async def main() -> None:
                     while True:
                         try:
                             text = await asyncio.wait_for(
-                                ble_q.get(), timeout=IDLE_CHECK_MS
+                                ble_line.get(), timeout=IDLE_CHECK_MS
                             )
                         except asyncio.TimeoutError:
                             if not client.is_connected:
@@ -321,32 +394,28 @@ async def main() -> None:
                         if not text:
                             print("ok", flush=True)
                             continue
-                        # The first write right after a fresh connect is commonly
-                        # flaky. Retry on the SAME connection with backoff instead of
-                        # tearing down and rescanning (which is slow and can drop the
-                        # line). Only give up if the connection itself is lost, then
-                        # requeue the line and reconnect so it isn't lost.
-                        delivered = False
-                        while not delivered:
-                            for attempt in range(1, WRITE_RETRIES + 1):
-                                try:
-                                    for chunk in chunk_text(text, limit):
-                                        await client.write_gatt_char(
-                                            TEXT_UUID, chunk.encode("utf-8"), response=True
-                                        )
-                                    delivered = True
-                                    break
-                                except Exception:
-                                    if not client.is_connected:
-                                        break
-                                    if attempt < WRITE_RETRIES:
-                                        await asyncio.sleep(WRITE_RETRY_DELAY)
-                            if delivered:
+                        if first_write:
+                            first_write = False
+                            elapsed = time.monotonic() - connected_at
+                            if elapsed < CONNECT_SETTLE_MS:
+                                await asyncio.sleep(CONNECT_SETTLE_MS - elapsed)
+                        # Interrupt semantics: deliver the latest line in chunks,
+                        # but if a newer line arrives mid-delivery, drop the rest
+                        # of this one — the outer loop picks up the new line.
+                        for chunk in chunk_text(text, limit):
+                            if not ble_line.empty():
                                 break
-                            await ble_q.put(text)
-                            raise ConnectionError("connection lost during write")
+                            try:
+                                await client.write_gatt_char(
+                                    TEXT_BRIDGE_UUID, chunk.encode("utf-8"), response=True
+                                )
+                            except Exception:
+                                # Transient/failed write: the next line supersedes
+                                # this one anyway, so just move on.
+                                break
                         print("ok", flush=True)
             except Exception as e:
+                connected = False
                 print(f"err {e}", flush=True)
                 await asyncio.sleep(RECONNECT_DELAY)
 

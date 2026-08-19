@@ -22,19 +22,43 @@ function resolvePython(): string | null {
   return which("python3") ?? which("python")
 }
 
-const FLUSH_MS = 250
-const RATE = Math.max(1, parseFloat(process.env.RGBIFY_CHARS_PER_SEC ?? "30") || 30)
+// Hard safety cap: a single oversized write corrupts the firmware's LEDText
+// scroll state. The bridge chunks to the BLE MTU anyway; this only guards the
+// full-message path (chat.message). Not a buffer — the LAST MAX_TEXT chars win.
+const MAX_TEXT = 256
 
 function isEnabled(): boolean {
   return process.env.RGBIFY_DISABLE !== "1" && process.env.RGBIFY_DISABLE !== "true"
+}
+
+// Keep ONLY printable ASCII (Atari font supports ~32-122). Drop control bytes,
+// UTF-8/multibyte garbage, and any angle-bracket tag (e.g. dcp-message-id).
+// Tags stream in as multiple token deltas, so tag-open state must persist
+// across sanitize() calls — otherwise a split tag's tail (e.g. "-age-id>")
+// would leak through.
+let inTag = false
+
+function sanitize(text: string): string {
+  let out = ""
+  for (const ch of text) {
+    if (inTag) {
+      if (ch === ">") inTag = false
+      continue
+    }
+    if (ch === "<") {
+      inTag = true
+      continue
+    }
+    const code = ch.charCodeAt(0)
+    if (code >= 0x20 && code <= 0x7e) out += ch
+  }
+  return out
 }
 
 export const RGBifyProjectorPlugin: Plugin = async ({ client }) => {
   if (!isEnabled()) return {}
 
   let procPromise: Promise<ReturnType<typeof spawn>> | null = null
-  let pending = ""
-  let flushTimer: ReturnType<typeof setTimeout> | null = null
   const seenEventTypes = new Set<string>()
 
   function startBridge(): Promise<ReturnType<typeof spawn>> {
@@ -48,9 +72,7 @@ export const RGBifyProjectorPlugin: Plugin = async ({ client }) => {
         stderr: "pipe",
         env: { ...process.env },
       })
-      void proc.stdout?.pipeTo(
-        new WritableStream({ write() {} }),
-      )
+      void proc.stdout?.pipeTo(new WritableStream({ write() {} }))
       void proc.stderr?.pipeTo(
         new WritableStream({ write() {} }),
       )
@@ -62,28 +84,17 @@ export const RGBifyProjectorPlugin: Plugin = async ({ client }) => {
     return procPromise
   }
 
-  function scheduleFlush() {
-    if (flushTimer) return
-    flushTimer = setTimeout(() => {
-      flushTimer = null
-      flush()
-    }, FLUSH_MS)
-  }
-
-  function flush() {
-    if (flushTimer) {
-      clearTimeout(flushTimer)
-      flushTimer = null
-    }
-    const line = pending
-    pending = ""
+  // Interrupt semantics: every event is delivered immediately as its own line.
+  // No accumulation, no debounce timer, no rate limiter. The bridge keeps only
+  // the latest line, so a newer event supersedes any still in flight — the last
+  // message is the only message.
+  function send(text: string) {
+    const line = sanitize(text).slice(-MAX_TEXT)
     if (!line) return
-    const budget = Math.max(1, Math.round((RATE * FLUSH_MS) / 1000))
-    const clipped = line.slice(-budget)
-    debug(`flush line=${line.length} sent=${clipped.length}`)
+    debug(`send len=${line.length}`)
     startBridge()
       .then((proc) => {
-        proc.stdin.write(clipped + "\n")
+        proc.stdin.write(line + "\n")
       })
       .catch(async (err) => {
         await client.app.log({
@@ -92,16 +103,8 @@ export const RGBifyProjectorPlugin: Plugin = async ({ client }) => {
       })
   }
 
-  function send(text: string) {
-    if (!text) return
-    pending += text
-    scheduleFlush()
-  }
-
   function sendNow(text: string) {
-    if (!text) return
-    pending += text
-    flush()
+    send(text)
   }
 
   startBridge().catch(async (err) => {
