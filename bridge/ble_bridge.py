@@ -316,8 +316,21 @@ async def main() -> None:
         finally:
             auralizer.stop()
 
+    async def watch_parent() -> None:
+        # Robust orphan guard. stdin EOF normally exits us when the opencode
+        # plugin that spawned us dies, but if another child of opencode (e.g. an
+        # MCP server) inherited the pipe's write end, EOF never arrives. Detect
+        # the parent's death directly instead: when it dies we are reparented
+        # (ppid changes), so exit then.
+        ppid = os.getppid()
+        while True:
+            await asyncio.sleep(1)
+            if os.getppid() != ppid:
+                os._exit(0)
+
     asyncio.create_task(read_stdin())
     asyncio.create_task(broadcast())
+    asyncio.create_task(watch_parent())
     host_task = asyncio.create_task(host_auralize())
 
     async def ble_loop() -> None:
