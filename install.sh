@@ -28,7 +28,7 @@ else
     say "WARN" "apt-get not found — install PortAudio manually (sounddevice needs libportaudio)"
 fi
 
-# ── 2 — Global plugin setup in ~/.config/opencode ──
+# ── 2 — Global plugin setup in ~/.config/opencode (COPY, not symlink) ──
 GLOBAL_DIR="$USER_HOME/.config/opencode"
 PLUGIN_DIR="$GLOBAL_DIR/opencode-rgbify-plugin"
 PLUGINS_DIR="$GLOBAL_DIR/plugins"
@@ -36,13 +36,17 @@ LOADER="$PLUGINS_DIR/projector.ts"
 
 run_as_user mkdir -p "$PLUGINS_DIR"
 
-if [ -L "$PLUGIN_DIR" ] && [ "$(readlink -f "$PLUGIN_DIR")" = "$SCRIPT_DIR" ]; then
-    say "OK" "global plugin symlink up to date"
-else
+# Copy the plugin source into the global config so it keeps working even if
+# the source repo is moved or deleted. .venv is machine-specific and created
+# below; .git is not needed at runtime. If a previous install left a symlink,
+# remove it first so the rm -rf below never follows it into the source repo.
+if [ -L "$PLUGIN_DIR" ]; then
     run_as_user rm -f "$PLUGIN_DIR"
-    run_as_user ln -s "$SCRIPT_DIR" "$PLUGIN_DIR"
-    say "OK" "symlinked $PLUGIN_DIR -> $SCRIPT_DIR"
 fi
+run_as_user mkdir -p "$PLUGIN_DIR"
+run_as_user rm -rf "$PLUGIN_DIR/src" "$PLUGIN_DIR/bridge"
+run_as_user cp -r "$SCRIPT_DIR/src" "$SCRIPT_DIR/bridge" "$SCRIPT_DIR/package.json" "$PLUGIN_DIR/"
+say "OK" "copied plugin to $PLUGIN_DIR"
 
 run_as_user bash -s "$LOADER" <<'EOF'
 cat > "$1" <<'LOADER'
@@ -56,7 +60,7 @@ export PATH="$USER_HOME/.local/bin:$PATH"
 if ! command -v uv >/dev/null 2>&1; then
     say "WARN" "uv not found — install bleak + sounddevice into the plugin venv manually"
 else
-    run_as_user env "VENV_DIR=$SCRIPT_DIR/.venv" bash -c '
+run_as_user env "VENV_DIR=$PLUGIN_DIR/.venv" bash -c '
         export PATH="$HOME/.local/bin:$PATH"
         [ -x "$VENV_DIR/bin/python" ] || uv venv "$VENV_DIR"
         uv pip install --python "$VENV_DIR/bin/python" bleak sounddevice numpy
@@ -64,7 +68,7 @@ else
 fi
 
 # ── 4 — Verify ──
-if "$SCRIPT_DIR/.venv/bin/python" -c 'import bleak, sounddevice' 2>/dev/null; then
+if "$PLUGIN_DIR/.venv/bin/python" -c 'import bleak, sounddevice' 2>/dev/null; then
     say "OK" "bridge deps importable (bleak + sounddevice)"
 else
     say "WARN" "bridge deps not importable (RGBify bridge optional)"
