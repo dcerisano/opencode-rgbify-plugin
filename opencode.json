@@ -1,0 +1,113 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "small_model": "opencode/deepseek-v4-flash-free",
+  "instructions": [],
+  "compaction": {
+    "auto": false
+  },
+  "plugin": ["@tarquinen/opencode-dcp@3.1.15"],
+  "command": {
+    "dcp": {
+      "template": "",
+      "description": "DCP panel: context, stats, sweep, manual mode"
+    }
+  },
+  "agent": {
+    "plan": {
+      "temperature": 0.1,
+      "top_p": 0.9
+    },
+    "build": {
+      "temperature": 0.0,
+      "top_p": 0.9
+    },
+    "explore": {
+      "temperature": 0.1,
+      "top_p": 0.9
+    }
+  },
+  "mcp": {
+    "serena": {
+      "type": "local",
+      "command": [
+        "uvx",
+        "-p",
+        "3.13",
+        "--from",
+        "serena-agent==1.7.0",
+        "serena",
+        "start-mcp-server",
+        "--context=ide",
+        "--project-from-cwd",
+        "--open-web-dashboard=False"
+      ],
+      "enabled": true
+    },
+    "context7": {
+      "type": "remote",
+      "url": "https://mcp.context7.com/mcp",
+      "headers": {
+        "CONTEXT7_API_KEY": "{env:CONTEXT7_API_KEY}"
+      },
+      "enabled": true
+    }
+  },
+  "permission": {
+    "edit": "ask",
+    "grep": "allow",
+    "glob": "allow",
+    "bash": {
+      "git push": "ask"
+    }
+  },
+  "provider": {
+    "local-llm": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Local LLM Server",
+      "options": {
+        "baseURL": "http://localhost:11434/v1"
+      },
+      "models": {
+        "qwen3:8b": {
+          "name": "qwen3:8b",
+          "id": "qwen3:8b",
+          "tools": true,
+          "parameters": {
+            "temperature": 0.1,
+            "top_p": 0.9
+          },
+          "limit": {
+            "context": 32000,
+            "input": 32000,
+            "output": 8192
+          },
+          "options": {
+            "textVerbosity": "low"
+          }
+        },
+        "qwen:8b": {
+          "name": "qwen2.5-coder:7b",
+          "id": "qwen2.5-coder:7b",
+          "tools": true,
+          "parameters": {
+            "temperature": 0.1,
+            "top_p": 0.9
+          },
+          "limit": {
+            "context": 32000,
+            "input": 32000,
+            "output": 8192
+          },
+          "options": {
+            "textVerbosity": "low"
+          }
+        }
+      }
+    }
+  },
+  "experimental": {
+    "primary_tools": ["compress"]
+  },
+  "default_agent": "build",
+  "lsp": false
+}

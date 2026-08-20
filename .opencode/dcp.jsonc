@@ -1,0 +1,39 @@
+{
+    "$schema": "https://raw.githubusercontent.com/Opencode-DCP/opencode-dynamic-context-pruning/master/dcp.schema.json",
+    "enabled": true,
+    "manualMode": {
+        "enabled": false,
+        "automaticStrategies": true
+    },
+    "pruneNotification": "minimal",
+    "pruneNotificationType": "chat",
+    "compress": {
+        "permission": "allow",
+        "mode": "range",
+        "maxContextLimit": "70%",
+        "minContextLimit": "30%",
+        "nudgeFrequency": 3,
+        "iterationNudgeThreshold": 15,
+        "summaryBuffer": true,
+        "nudgeForce": "strong",
+        "protectedTools": ["serena_*", "context7_*"]
+    },
+    "strategies": {
+        "deduplication": {
+            "enabled": true,
+            "protectedTools": ["serena_*"]
+        },
+        "purgeErrors": {
+            "enabled": true,
+            "turns": 4,
+            "protectedTools": []
+        }
+    },
+    "turnProtection": {
+        "enabled": true,
+        "turns": 2
+    },
+    "experimental": {
+        "allowSubAgents": true
+    }
+}
