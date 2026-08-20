@@ -68,7 +68,9 @@ run_as_user env "VENV_DIR=$PLUGIN_DIR/.venv" bash -c '
 fi
 
 # ── 4 — Verify ──
-if "$PLUGIN_DIR/.venv/bin/python" -c 'import bleak, sounddevice' 2>/dev/null; then
+# Run as the user with -B so the import never writes root-owned .pyc files
+# into the user's venv (Python compiles bytecode cache on import).
+if run_as_user "$PLUGIN_DIR/.venv/bin/python" -B -c 'import bleak, sounddevice' 2>/dev/null; then
     say "OK" "bridge deps importable (bleak + sounddevice)"
 else
     say "WARN" "bridge deps not importable (RGBify bridge optional)"
